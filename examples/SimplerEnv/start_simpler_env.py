@@ -25,7 +25,7 @@ if __name__ == "__main__":
     os.environ["DISPLAY"] = ""
     # prevent a single jax process from taking up all the GPU memory
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    import debugpy 
+    # import debugpy 
     # if os.environ.get("DEBUG", None):
 
     #     debugpy.listen(("0.0.0.0", 10092))  # listen port 
