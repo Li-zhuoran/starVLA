@@ -58,20 +58,29 @@ class Qwen_PI(baseframework):
 
         super().__init__()
         self.config = config
+        # 初始化视觉语言模型接口，用于处理图像和文本输入
         self.qwen_vl_interface = get_vlm_model(config=self.config)
 
-        # dynamic get llm config
+        # 动态获取LLM配置参数
+        # llm_layers: LLM层数，llm_hidden_size: LLM隐藏层维度
         llm_layers, llm_hidden_size = 36, self.qwen_vl_interface.model.config.hidden_size
 
+        # 配置DiT模型参数
         DiTConfig = {"num_layers": llm_layers, "input_embedding_dim": 2048, "attention_head_dim": 64, "num_attention_heads": 32}
+        # 设置动作模型的隐藏层大小
         self.config.framework.action_model.hidden_size = llm_hidden_size #check what this for?
+        # 设置扩散模型交叉注意力维度与LLM隐藏层大小一致
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = llm_hidden_size
 
+        # 将DiT配置保存到框架配置中
         self.config.framework.action_model.DiTConfig = DiTConfig
+        # 初始化动作预测模型
         self.action_model: LayerwiseFlowmatchingActionHead = get_action_model(config=self.config)  # 修复后续引用
 
+        # 缓存动作窗口大小配置
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
+        # 计算总的chunk长度（过去窗口大小+当前时刻+未来窗口大小）
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         
 
@@ -99,14 +108,16 @@ class Qwen_PI(baseframework):
             dict:
                 action_loss (torch.Tensor): Scalar diffusion noise prediction loss.
         """
+        # 提取批次数据中的图像、指令和动作
         batch_images = [example["image"] for example in examples]  #  [B，[PLT]]
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"] for example in examples]  # label [B， len, 7]
         
+        # 提取状态信息（如果存在）
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
         
 
-        # Step 1: QWenVL input format
+        # Step 1: 构建QWenVL输入格式并获取视觉-语言融合表征
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
@@ -121,7 +132,7 @@ class Qwen_PI(baseframework):
             vl_embs_list = list(all_hidden[-expected_layers:])
             base_hidden = vl_embs_list[-1]
 
-        # Step 4: Action Expert Forward and Loss
+        # Step 4: 执行动作专家前向传播并计算损失
         with torch.autocast("cuda", dtype=torch.float32):
             # 标签对齐：取最后 chunk_len 段
             actions = torch.tensor(
