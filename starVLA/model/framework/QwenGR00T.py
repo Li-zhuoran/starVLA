@@ -59,12 +59,18 @@ class Qwen_GR00T(baseframework):
         """
         super().__init__()
         self.config = config
+        
+        # 初始化视觉语言模型接口
         self.qwen_vl_interface = get_vlm_model(config=self.config)
-        # align dims --> we should put them to config or no?
+        
+        # 对齐交叉注意力维度与视觉语言模型隐藏层维度
+        # TODO: 考虑将此配置移到配置文件中
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
 
+        # 初始化动作模型（流匹配头部）
         self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)  # 修复后续引用
 
+        # 设置动作窗口大小参数
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
@@ -76,16 +82,32 @@ class Qwen_GR00T(baseframework):
         **kwargs,
     ) -> Tuple:
         """
-
+        前向传播函数，用于处理输入样本并计算动作预测损失。
+        
+        该函数接收一批样本数据，通过Qwen-VL模型提取视觉语言特征，
+        然后使用动作模型预测连续动作序列，并计算预测损失。
+        
+        Args:
+            examples (List[dict]): 包含训练样本的列表，每个样本是一个字典，
+                包含以下键值对：
+                - "image": 图像数据
+                - "lang": 指令文本
+                - "action": 动作标签
+                - "state": 状态信息（可选）
+            **kwargs: 其他关键字参数（未使用）
+            
+        Returns:
+            Tuple: 包含动作损失的字典，键为"action_loss"
         """
+        # 从样本中提取图像、指令和动作标签
         batch_images = [example["image"] for example in examples]  #  [B，[PLT]]
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"] for example in examples]  # label [B， len, 7]
         
+        # 提取状态信息（如果存在）
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
         
-
-        # Step 1: QWenVL input format
+        # 使用Qwen-VL接口构建输入并获取视觉语言特征
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
@@ -97,7 +119,7 @@ class Qwen_GR00T(baseframework):
             # last_hidden_state: [B, seq_len, H]
             last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
 
-        # Step 4: Action Expert Forward and Loss
+        # 动作专家前向传播及损失计算
         with torch.autocast("cuda", dtype=torch.float32):
             # 标签对齐：取最后 chunk_len 段
             actions = torch.tensor(
@@ -105,6 +127,7 @@ class Qwen_GR00T(baseframework):
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -(self.future_action_window_size+1):, :]  # (B, chunk_len, action_dim)
 
+            # 获取扩散步骤重复次数配置
             repeated_diffusion_steps = (
                 self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
             )
@@ -118,9 +141,8 @@ class Qwen_GR00T(baseframework):
                 )
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
+            # 计算动作预测损失
             action_loss = self.action_model(last_hidden_repeated, actions_target_repeated, state_repeated)  # (B, chunk_len, action_dim)
-
-
 
         return {"action_loss": action_loss}
 
@@ -133,30 +155,31 @@ class Qwen_GR00T(baseframework):
         **kwargs: str,
     ) -> np.ndarray:
         """
-        推理：单次前向直接回归未来动作（无扩散采样）。
+        执行推理以直接回归未来动作（无扩散采样）。
 
-        Steps:
-          1. Resize images to training resolution (if specified)
-          2. Encode with QwenVL (hidden states retained)
-          6. Return normalized action trajectory
+        步骤:
+          1. 将图像调整到训练时分辨率（如已指定）
+          2. 使用QwenVL编码图像（保留隐藏状态）
+          3. 使用动作模型预测动作
+          4. 返回归一化的动作轨迹
 
-        Args:
-            batch_images: List of samples; each sample is List[PIL.Image] (multi-view).
-            instructions: List[str] natural language task instructions.
-            cfg_scale: >1 enables classifier-free guidance (scales conditional vs unconditional).
-            use_ddim: Whether to use DDIM deterministic sampling.
-            num_ddim_steps: Number of DDIM steps if enabled.
-            **kwargs: Reserved.
+        参数:
+            batch_images: 样本列表；每个样本是List[PIL.Image]（多视角）。
+            instructions: List[str] 自然语言任务指令。
+            state: 可选的当前状态信息。
+            **kwargs: 预留参数。
 
-        Returns:
+        返回:
             dict:
-                normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
+                normalized_actions (np.ndarray): 形状为[B, T, action_dim]的归一化动作。
         """
+        # 获取训练时观测图像尺寸配置
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
+        # 如有设置则调整图像大小
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
     
-        # Step 1: QWenVL input format
+        # 构建QWenVL输入格式
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
@@ -168,11 +191,13 @@ class Qwen_GR00T(baseframework):
             # last_hidden_state: [B, seq_len, H]
             last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
 
+        # 处理状态信息张量
         state = torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype) if state is not None else None
-        # Step 4: Action Expert Forward and Loss
+        # 动作专家前向传播
         with torch.autocast("cuda", dtype=torch.float32):
             pred_actions = self.action_model.predict_action(last_hidden, state)  # (B, chunk_len, action_dim)
 
+        # 将预测动作转换为numpy数组并返回
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
 
