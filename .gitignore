@@ -215,3 +215,6 @@ assets/SAMv2.txt
 playground/*
 qwen_talk.md
 assets/R1Pro.py
+
+#local checkpoints
+starVLA/Qwen3VL-GR00T-Bridge-RT-1/
